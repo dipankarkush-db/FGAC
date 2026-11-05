@@ -42,6 +42,11 @@ ETL_PRINCIPALS = CFG.get("etl_principals", [])
 # who may read the audit views (schema audit): users, groups, or service principal application IDs. The admin always
 # can. They get USE SCHEMA and SELECT on the audit schema only: no HR data, no entitlement tables.
 AUDITORS = CFG.get("auditors", [])
+# the SQL text and error messages in the audit views (statements, restricted_reads): "redacted" (the default: string and
+# number literals become ?, so values someone typed, such as an INSERT's or a WHERE ssn = '...', never reach the
+# auditors) or "full"
+AUDIT_STATEMENT_TEXT = CFG.get("audit_statement_text", "redacted")
+assert AUDIT_STATEMENT_TEXT in ("redacted", "full"), f"audit_statement_text must be redacted or full, not {AUDIT_STATEMENT_TEXT}"
 # assoc_dim.status values of associates who have left: their records stay governed by their last hierarchy, but their
 # own login loses every entitlement, even if assoc_roles_dim still lists personas for it (fails closed)
 TERMINATED_STATUSES = CFG.get("terminated_statuses", ["Terminated"])

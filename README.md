@@ -101,7 +101,7 @@ Remove everything with `python3 -I poc.py destroy --yes`.
 | `python3 -I poc.py destroy --yes` | remove everything the deploy created |
 | `python3 -I tests/test_audit.py` | the audit trail end to end: makes reads, refused attempts and a stray grant, then finds each in the audit views (waits for the system tables, up to 30 minutes) |
 | `python3 -I dbsql.py [--as <user>] [--rt] "SQL"` | run SQL as you, a test user or the compiler; `--rt` on the Real-Time warehouse |
-| `python3 -I large_data.py load \| act-as \| status \| remove --yes` | the optional large synthetic data set (docs/HOW_TO_RUN.md, Appendix F) |
+| `python3 -I large_data.py load \| act-as \| status \| compile \| users \| remove --yes` | the optional large synthetic data set (docs/HOW_TO_RUN.md, Appendix F) |
 
 ## Repository layout
 
@@ -131,6 +131,7 @@ Remove everything with `python3 -I poc.py destroy --yes`.
 | A person who has left (`assoc_dim.status`) | their records stay governed by their last hierarchy; their own login gets nothing | `terminated_statuses` |
 | Hierarchy types | market, region, department, reporting line | `SCOPE_NODE` in the compiler |
 | Who may read the audit views | only the admin; list users, groups or service principal application IDs to give them USE SCHEMA and SELECT on `audit` (nothing else) | `auditors` |
+| What the audit views show of SQL text | string and number values in statements and error messages are shown as `?`, so values someone typed never reach the auditors; `full` shows the text as run | `audit_statement_text` |
 | How a view checks scope | `join` (the user's scope nodes joined once per query); `array` gives the same answers | `scope_check` |
 
 Bad export rows fail closed: a role row without a login, a login with two associate IDs, a persona with two scope types,

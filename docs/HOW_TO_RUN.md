@@ -3,7 +3,7 @@
 | | |
 | :---- | :---- |
 | What | Build, demo, test and remove the proof of concept: fine-grained access (rows and columns) on Databricks through generated secured views |
-| Tested | Deployed from nothing from this repository and run as printed, in a Databricks test workspace with synthetic data (Appendix E) |
+| Tested | Deployed from nothing from this repository and run as printed (section 4.10, the audit trail, through its automated test), in a Databricks test workspace with synthetic data (Appendix E) |
 | Scope | Functional and security tests (section 4, Appendix A); an optional large synthetic data set (Appendix F) |
 
 ## 0\. Before you start
@@ -64,7 +64,7 @@ Plus: the serverless SQL warehouse `fgac-poc`; the Lakehouse Real-Time warehouse
 | Workspace admin | create the service principals and the SQL warehouse |
 | Account admin (account login) | let you deploy jobs that run as the compiler; delete the principals in the account on removal |
 | `CREATE CATALOG` on the metastore | the deploy creates one catalog |
-| Metastore admin (or the owner of the `system` catalog) | let the compiler read the system tables `system.access` (audit log) and `system.query` (query history) for the audit views; without it the deploy prints a warning and the job's `audit` task fails (section 6) |
+| Metastore admin (or the owner of the `system` catalog) | let the compiler read the system tables `system.access` (audit log) and `system.query` (query history) for the audit views; if you can't grant this and the compiler can't already read them, the deploy stops and prints the three GRANTs a metastore admin must run (section 6) |
 | Serverless SQL and serverless jobs | everything runs on serverless |
 
 ### 1.2 Local tools
@@ -121,6 +121,7 @@ cp config.example.json config.json
 | `unclassified_rule` | `highly_sensitive` (the default: anyone with Highly Sensitive access sees unclassified columns) or `restricted` (never shown) | `highly_sensitive` |
 | `etl_principals` | optional: the identities that load data (ETL, the policy export job); the compiler's guard leaves their privileges alone | not set |
 | `auditors` | optional: who may read the audit views (users, groups, or service principal application IDs); they get USE SCHEMA and SELECT on `audit` only, and the guard revokes anything else there. You, the admin, can always read them | `[]` (only you) |
+| `audit_statement_text` | optional: `redacted` (string and number values in the SQL text and error messages of `statements` and `restricted_reads` are shown as `?`, so values someone typed never reach the auditors) or `full` | `redacted` |
 | `terminated_statuses` | the `assoc_dim.status` values of people who have left: their own login gets no entitlement (section 4.8) | `["Terminated"]` |
 | `large_data` | the optional large data set (Appendix F): its catalog, number of associates, and the warehouse that builds it | see `config.example.json` |
 | `scope_check` | how a view checks a persona's scope: `join` (the design: the person's nodes joined once per query to `governance.assoc_scope_node`) or `array` (an alternative form with the same answers) | `join` |
@@ -134,7 +135,7 @@ python3 -I poc.py status
 python3 -I poc.py deploy --verify
 ```
 
-It creates, in order: the SQL warehouse; the ten service principals (nine test users and the compiler) and their secrets; the catalog with the HR base tables and the policy exports (`setup/01_catalog_and_hr_data.sql`, `setup/02_policy_exports.sql`); the grants (the compiler owns everything; `account users` may read `hr_secure` only; the compiler may read the system tables `system.access` and `system.query`, for the audit views); the two jobs (Databricks Asset Bundle); then the first compile, through the compiler job, whose steps are `entitlements`, `views`, `audit` (the audit views in `audit`), `guard` and `invariants`. `--verify` then runs the test suites of Appendix A.
+It creates, in order: the SQL warehouse; the ten service principals (nine test users and the compiler) and their secrets; the catalog with the HR base tables and the policy exports (`setup/01_catalog_and_hr_data.sql`, `setup/02_policy_exports.sql`); the grants (the compiler owns everything; `account users` may read `hr_secure` only; the compiler may read the system tables `system.access` and `system.query`, for the audit views; if that grant fails and the compiler can't already read them, the deploy stops here and prints the GRANTs a metastore admin must run); the two jobs (Databricks Asset Bundle); then the first compile, through the compiler job, whose steps are `entitlements`, `views`, `audit` (the audit views in `audit`), `guard` and `invariants`. `--verify` then runs the test suites of Appendix A.
 
 Expected (about 11 minutes from nothing), ending with:
 
@@ -1255,7 +1256,7 @@ Expected: one row per (reader, view, personas held then), in the order of sectio
 | you | associate\_compensation\_vw | ["SELF","VP100"] | … | (4.3.8, and 4.4 on Real-Time) |
 | the application ID of `fgac-mm_market_abc` | associate\_compensation\_vw | ["SELF","VP100"] | … | (4.9, attempts 6 and 7) |
 
-`personas_then` comes from the entitlement history at the moment of the read, so the same reader shows a different persona after every `act-as`. `view_reads` holds the reads as Unity Catalog logs them: a READ event each time the warehouse fetches a table's credentials. A read that reuses credentials fetched shortly before, or an answer from the result cache, is not logged again, so `reads` is lower than the number of queries you ran. The record of every statement is `statements` (query D; a cached answer has `from_result_cache` = `true`).
+`personas_then` comes from the entitlement history: the last version compiled before the read, so the same reader shows a different persona after every `act-as`. `view_reads` holds the reads as Unity Catalog logs them: a READ event each time the warehouse fetches a table's credentials. A read that reuses credentials fetched shortly before, or an answer from the result cache, is not logged again, so `reads` is lower than the number of queries you ran. The record of every statement is `statements` (query D; a cached answer has `from_result_cache` = `true`).
 
 **B. Changes to the catalog by anyone but the compiler** (privileges, owners, objects created or dropped), and the guard's repairs:
 
@@ -1329,9 +1330,9 @@ WHERE start_time >= current_timestamp() - INTERVAL 3 HOURS AND execution_status 
 ORDER BY start_time;
 ```
 
-Expected, among the rows: the refused attempts of 4.9 (1–5 and 8–10), each with `executed_by` the application ID of `fgac-mm_market_abc`, its SQL and its error (`INSUFFICIENT_PERMISSIONS ... USE SCHEMA`, `PERMISSION_DENIED ... CREATE TABLE`, `UNSUPPORTED_FEATURE.TIME_TRAVEL`, `PERMISSION_DENIED ... MANAGE`).
+Expected, among the rows: the refused attempts of 4.9 (1–5 and 8–10), each with `executed_by` the application ID of `fgac-mm_market_abc`, its SQL (string and number values shown as `?`, for example `WHERE base_salary = ?`: `audit_statement_text` is `redacted` by default) and its error (`INSUFFICIENT_PERMISSIONS ... USE SCHEMA`, `PERMISSION_DENIED ... CREATE TABLE`, `UNSUPPORTED_FEATURE.TIME_TRAVEL`, `PERMISSION_DENIED ... MANAGE`).
 
-Two more audit views: `restricted_reads` (anyone but the compiler reading `hr_base`, `policy` or `governance` directly, from both sources: the audit log's READ events, and every statement that names those schemas, refused ones included; here you, the admin, for example in Appendix C, and `fgac-mm_market_abc`'s refused attempts 1–3 of 4.9, with `execution_status` `FAILED`) and `compile_runs` (the compiler's runs, as in Appendix C5).
+Two more audit views: `restricted_reads` (anyone but the compiler reading `hr_base`, `policy` or `governance` directly, from both sources: the audit log's READ events, and every statement that names those schemas, refused ones included, but not the queries of the audit views themselves; here you, the admin, for example in Appendix C, and `fgac-mm_market_abc`'s refused attempts 1–3 of 4.9, with `execution_status` `FAILED`) and `compile_runs` (the compiler's runs, as in Appendix C5).
 
 Say: the audit trail answers who read which view, with which personas, and who tried to change what, without any extra logging: it is built on the platform's own audit log and query history, and the auditors read it without seeing any HR data.
 
@@ -1394,7 +1395,7 @@ Expected (about 2–3 minutes): one `===` block per part, then `Destroy finished
 | A query result hasn't changed after a policy change | the compiler run started by the change hasn't finished (a change that lands during a run waits for the next one) | wait a minute and run the query again |
 | Your login sees nothing in the views | your login holds no persona (that is the default) | `python3 -I poc.py act-as <persona>` |
 | A view fails with `UNRESOLVED_COLUMN` | a base table column was dropped since the last compile (the view fails closed) | `python3 -I poc.py run-job compiler` |
-| The job fails in the `audit` task with `audit.<view> could not be (re)created` and a message about `system` | the compiler can't read the system tables (the deploy printed a WARNING in `grants and ownership`) | a metastore admin runs, in the SQL editor: `` GRANT USE CATALOG ON CATALOG system TO `<compiler application ID>`; `` `` GRANT USE SCHEMA, SELECT ON SCHEMA system.access TO `<compiler application ID>`; `` `` GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO `<compiler application ID>`; `` (the ID is `compiler` in `~/.fgac_principals.json`), then `python3 -I poc.py run-job compiler`. The other steps are not affected: entitlements and views are compiled before it |
+| The deploy stops in `grants and ownership` with `The compiler cannot read the system tables`, or the job fails in the `audit` task with `audit.<view> could not be (re)created` and a message about `system` | the compiler can't read the system tables, and you can't grant it (or the grant was revoked later) | a metastore admin runs, in the SQL editor: `` GRANT USE CATALOG ON CATALOG system TO `<compiler application ID>`; `` `` GRANT USE SCHEMA, SELECT ON SCHEMA system.access TO `<compiler application ID>`; `` `` GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO `<compiler application ID>`; `` (the ID is `compiler` in `~/.fgac_principals.json`), then `python3 -I poc.py run-job compiler`. The other steps are not affected: entitlements and views are compiled before it |
 | The audit views show nothing of the last few minutes | the system tables arrive with a delay: the query history after about 8–9 minutes (`statements`, the query-history rows of `restricted_reads`), the audit log after about 16–22 minutes (`view_reads`, `governance_changes`) | wait and run the query again (section 4.10: about 25 minutes after the events) |
 | `INSUFFICIENT_PERMISSIONS` on `audit` for an auditor | the auditor is not in `auditors`, or the compiler hasn't run since it was added | add it to `auditors` in `config.json`, `python3 -I poc.py deploy` (uploads the setting), then `python3 -I poc.py run-job compiler` |
 | The job fails in the `invariants` task | a repair could not finish (for example a view that can't be regenerated, which is then dropped), or a compile is behind | the task output names it; fix the cause and `python3 -I poc.py run-job compiler`. An edited view or a stray grant alone does not fail the job: the run repairs it first and logs it in `governance.compile_log` |
@@ -1438,7 +1439,7 @@ python3 -I tests/test_audit.py
 - the policy exports are consistent: no role row without a login, one `win` per login, one scope type per persona, no policy row without a classification or a category (the compiler grants nothing from a row that breaks these, and this invariant names it so the export gets fixed);  
 - the entitlements cover exactly the users in the exports (by the same rules), minus the people who have left; nobody who has left holds an entitlement; a compile ran in the last 24 hours; every export change was compiled within 30 minutes.
 
-**`test_audit.py`: the audit trail.** It makes things happen, then finds each of them in the audit views, as the admin: `people_mgr` reads `associate_compensation_vw` (and again on the Real-Time warehouse, if there is one); `mm_market_abc` tries to read a base table and to create a view in `hr_secure` (both refused); `mm_market_abc` also tries to copy the view into a table of its own in `hr_secure` (refused); you read a base table directly and grant `no_persona` SELECT on `governance.compile_log`, which the guard (run by the test) revokes. Each statement carries a random number, so it is unique and never served from the result cache. Then it checks every minute until all are found, or `AUDIT_WAIT_MINUTES` (default 30) have passed. Expected: 11 `PASS` lines (13 with a Real-Time warehouse), each with the minutes it took (on 2026-11-05: the query history after 9 minutes, the audit log after 22), and `0 failure(s)`:
+**`test_audit.py`: the audit trail.** It makes things happen, then finds each of them in the audit views, as the admin: `people_mgr` reads `associate_compensation_vw` (and again on the Real-Time warehouse, if there is one); `mm_market_abc` tries to read a base table and to create a view in `hr_secure` (both refused); `mm_market_abc` also tries to copy the view into a table of its own in `hr_secure` (refused); you read a base table directly and grant `no_persona` SELECT on `governance.compile_log`, which the guard (run by the test) revokes. Each statement carries a random number, so it is unique and never served from the result cache, and a comment `/* audit_test_t<number> */`, which survives the redaction of literals and makes it findable. Then it checks every minute until all are found, or `AUDIT_WAIT_MINUTES` (default 30) have passed, and last that `people_mgr`'s reads through the view are not in `restricted_reads`. Expected: 13 `PASS` lines (15 with a Real-Time warehouse), each with the minutes it took (in our test: the query history after about 9 minutes, the audit log after about 22), and `0 failure(s)` (with `audit_statement_text: full`, the redaction check is left out: one line fewer):
 
 ```text
 PASS  view_reads: people_mgr read associate_compensation_vw, with the personas they held then
@@ -1452,8 +1453,10 @@ PASS  restricted_reads: mm_market_abc's refused read of the base table
 PASS  governance_changes: mm_market_abc's refused copy of the view into a table
 PASS  compile_runs: the guard's run that revoked the grant
 PASS  entitlement_changes: people_mgr's current entitlement
+PASS  statements: literals are redacted (the number in the read's WHERE is shown as ?)
 PASS  statements: the read on the Real-Time warehouse
 PASS  view_reads: both reads by people_mgr (SQL warehouse and Real-Time)
+PASS  restricted_reads: nothing for people_mgr (only secured view reads)
 ```
 
 The last two run only when there is a Real-Time warehouse.
@@ -1721,7 +1724,7 @@ Expected: 6 rows, all `VIEW`: `compile_runs`, `entitlement_changes`, `governance
 | :---- | :---- | :---- | :---- |
 | `view_reads` | read of a secured view as Unity Catalog logs it (a READ event when the warehouse fetches a base table's credentials; a read that reuses recent credentials, or a cached answer, is not logged again) | the Unity Catalog audit log | `read_at`, `event_date`, `reader`, `view_name`, `base_table`, `personas_then`, `status_code` |
 | `restricted_reads` | direct read of `hr_base`, `policy` or `governance` by anyone but the compiler: an audit-log READ event, or a statement that names one of those schemas (refused ones included) | the Unity Catalog audit log and the query history (`UNION ALL`) | `read_at`, `event_date`, `reader`, `source` (`audit log` or `query history`), `object_name` (audit-log rows), `statement_text` and `execution_status` (query-history rows), `workspace_id`, `id` |
-| `statements` | SQL statement that names the catalog | the query history | `start_time`, `executed_by`, `by_compiler`, `execution_status`, `error_message`, `from_result_cache`, `warehouse_id`, `statement_text` |
+| `statements` | SQL statement that names the catalog as `catalog.schema.` (with or without backticks; one relying on `USE CATALOG` or the editor's catalog picker is not matched); string and number literals in its text and error shown as `?` unless `audit_statement_text` is `full` | the query history | `start_time`, `executed_by`, `by_compiler`, `execution_status`, `error_message`, `from_result_cache`, `warehouse_id`, `statement_text` |
 | `governance_changes` | privilege, owner, create (a refused copy into a table, `createStagingTable`, included), drop or alter on the catalog or its objects (the compiler's own data writes and staging tables left out) | the Unity Catalog audit log | `changed_at`, `changed_by`, `by_compiler`, `change`, `object_name`, `detail`, `outcome` (`done`, `denied`, `failed`) |
 | `entitlement_changes` | version of a user's entitlement | `governance.user_entitlement_history` | `user_principal`, `change_type`, `valid_from`, `valid_to`, `is_current`, `personas_before`, `personas`, `granted_pairs_before`, `granted_pairs` |
 | `compile_runs` | compiler step run | `governance.compile_log` | `run_at`, `step`, `duration_s`, `run_by`, `detail`, `source_versions` |
@@ -1751,7 +1754,18 @@ Filter on `event_date` (or `start_time`) first: the audit log holds the whole ac
 
 ## Appendix E: test record
 
-@@TEST_RECORD@@
+What was run before this version was published, in a Databricks test workspace on Azure with the synthetic data, on
+both a serverless SQL warehouse and a Lakehouse Real-Time warehouse. Only what is listed here was run.
+
+| Date | What was run | Result |
+| :---- | :---- | :---- |
+| 2026-11-05 | a fresh clone of this repository, deployed from nothing: `poc.py deploy --verify` (correctness and exfiltration), the invariants, every expected value of sections 4.2–4.4 on both warehouses, sections 4.7–4.9 with their changes and undos, export rows that break the rules (loaded, checked, removed) | all passed: correctness 0 failures, exfiltration 0 failures, invariants 14 / 14, sections 4.2–4.4 33 / 33 on each warehouse, 4.7–4.9 19 / 19, bad rows as expected |
+| 2026-11-05 | the large data set (Appendix F) with `--associates 200000`: load, `act-as`, the Appendix F queries on both warehouses, the invariants, remove | the same answers on both warehouses; invariants 14 / 14. The default size (10,000,000 associates) was not run |
+| 2026-11-05 | after a code review of the audit layer, on the deployed copy: `poc.py deploy --verify`, the invariants (before and after), sections 4.2–4.4 on both warehouses, 4.7–4.9, the bad export rows, `tests/test_access.py` and `tests/test_security.py` on the Real-Time warehouse, `tests/test_audit.py` | all passed: correctness 0 failures on each warehouse, exfiltration 29 / 29 (and 0 failures on Real-Time), invariants 14 / 14, 4.2–4.4 33 / 33, 4.7–4.9 0 failures, bad rows as expected, audit test 15 / 15 (the query history caught up after 6–9 minutes, the audit log after 12–16) |
+| 2026-11-05 | the `auditors` setting by hand: a test principal listed, then removed | listed, it read the audit views but not `governance` or any secured view row; removed, the next compiler run revoked its grant |
+
+Not run as printed: section 4.10 (its queries were run, and `tests/test_audit.py` covers the same events). If a
+result differs from this guide, open an issue.
 
 ## Appendix F: the large synthetic data set (optional)
 

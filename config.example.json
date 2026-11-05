@@ -13,6 +13,7 @@
   "unclassified_rule": "highly_sensitive",
   "terminated_statuses": ["Terminated"],
   "auditors": [],
+  "audit_statement_text": "redacted",
   "scope_check": "join",
   "large_data": {
     "catalog": "fgac_large",

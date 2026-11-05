@@ -161,9 +161,18 @@ def ensure_grants():
                   f"GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO `{comp}`"]:
             q(s)
         print("    the compiler may read system.access (audit log) and system.query (query history), for the audit views")
-    except RuntimeError as e:
-        print(f"    WARNING: could not let the compiler read the system tables ({str(e).splitlines()[0][:120]}): a metastore"
-              " admin must run these grants, or the audit step fails (Runbook section 6)")
+    except RuntimeError as e:  # granted earlier by a metastore admin? Then nothing is missing
+        try:
+            cc = dbsql.client(config.COMPILER)
+            for t in ("system.access.audit", "system.query.history"):
+                dbsql.run(cc, f"SELECT 1 FROM {t} LIMIT 0", quiet=True)
+            print("    the compiler can already read system.access and system.query (granted by a metastore admin)")
+        except RuntimeError:
+            sys.exit(f"The compiler cannot read the system tables, and you cannot grant it ({' '.join(str(e).split())[:160]}).\n"
+                     f"A metastore admin must run, once:\n  GRANT USE CATALOG ON CATALOG system TO `{comp}`;\n"
+                     f"  GRANT USE SCHEMA, SELECT ON SCHEMA system.access TO `{comp}`;\n"
+                     f"  GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO `{comp}`;\n"
+                     "then run deploy again. Without them the audit step fails on every compile.")
 
 
 def compile_now():

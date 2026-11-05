@@ -404,19 +404,30 @@ CHANGE_ACTIONS = ("updatePermissions", "createCatalog", "updateCatalog", "delete
 def audit_views(me):
     """{view: SQL} for the audit schema. `me` is the compiler's identity (its own changes are flagged by_compiler).
     Every view keeps the system table's date (event_date) or time column: filter on it, the audit log is large."""
-    c = lit(C)
+    c, m = lit(C), lit(me)
     secure, restricted = f"{c}.{SECURE}.", [f"{c}.{s}." for s in (BASE, config.EXPORTS, config.GOV)]
     # a read: Unity Catalog logs a READ snapshot when the warehouse fetches a table's credentials, with the securable the
-    # query named (the secured view, or the table itself when someone reads it directly). A result-cache answer reads
-    # no table, and a repeated read can reuse the credentials fetched shortly before: the query history (statements)
-    # has every statement
+    # query named (the secured view, or the table itself when someone reads it directly), however the query spelled
+    # it. A result-cache answer reads no table, and a repeated read can reuse the credentials fetched shortly before:
+    # the query history (statements) has every statement that names the catalog
     read = f"""FROM system.access.audit a
 LATERAL VIEW explode(from_json(a.request_params.securables, 'ARRAY<STRUCT<type: STRING, full_name: STRING>>')) s AS o
 WHERE a.service_name = 'unityCatalog' AND a.action_name = 'metadataAndPermissionsSnapshot'
   AND a.request_params.operation = 'READ' AND contains(a.request_params.securables, '{c}.')"""
+    # the query history only has the text: a statement names the catalog as catalog.schema (backticks removed). One
+    # that relies on USE CATALOG or the editor's catalog picker is not matched (its reads are in the audit log anyway)
+    norm = "replace(lower(h.statement_text), '`', '')"
+    names_catalog = f"contains({norm}, '{c.lower()}.')"
+
+    def text(col):
+        """SQL text and error messages can hold values someone typed (an INSERT's literals, a WHERE ssn = '...'
+        probe): unless audit_statement_text is "full", string and number literals are replaced by ?"""
+        if config.AUDIT_STATEMENT_TEXT == "full":
+            return col
+        return f"""regexp_replace(regexp_replace({col}, r"'([^']|'')*'", "'?'"), r"\\b[0-9]+([.][0-9]+)?\\b", "?")"""
     actions = ", ".join(f"'{x}'" for x in CHANGE_ACTIONS)
     views = {
-        # with the personas the reader held at that moment (the entitlement history version open then)
+        # with the personas the reader held then: the last entitlement version compiled before the read
         "view_reads": f"""SELECT r.read_at, r.event_date, r.reader, r.view_name, r.base_table, h.personas AS personas_then,
        r.status_code, r.workspace_id, r.source_ip_address, r.user_agent, r.request_id
 FROM (SELECT a.event_time AS read_at, a.event_date, a.user_identity.email AS reader, o.full_name AS view_name,
@@ -424,30 +435,31 @@ FROM (SELECT a.event_time AS read_at, a.event_date, a.user_identity.email AS rea
              a.workspace_id, a.source_ip_address, a.user_agent, a.request_id
       {read}
         AND startswith(o.full_name, '{secure}')) r
-LEFT JOIN {G}.user_entitlement_history h ON h.user_principal = lower(r.reader)
-  AND r.read_at >= h.valid_from AND (h.valid_to IS NULL OR r.read_at < h.valid_to)""",
-        # anyone but the compiler, from both records: the audit log's reads, and every statement (also refused ones)
-        # that names a restricted schema
+LEFT JOIN {G}.user_entitlement_history h ON h.user_principal = lower(r.reader) AND h.valid_from <= r.read_at
+QUALIFY row_number() OVER (PARTITION BY r.request_id, r.view_name ORDER BY h.valid_from DESC NULLS LAST) = 1""",
+        # anyone but the compiler, from both records: the audit log's reads, and every statement (refused ones too)
+        # that names a restricted schema; the auditors' own queries of the audit views are left out
         "restricted_reads": f"""SELECT a.event_time AS read_at, a.event_date, a.user_identity.email AS reader, 'audit log' AS source,
        o.full_name AS object_name, CAST(NULL AS STRING) AS statement_text, CAST(NULL AS STRING) AS execution_status,
        a.workspace_id, a.request_id AS id
 {read}
   AND ({' OR '.join(f"startswith(o.full_name, '{r}')" for r in restricted)})
-  AND a.user_identity.email <> '{lit(me)}'
+  AND a.user_identity.email IS DISTINCT FROM '{m}'
 UNION ALL
-SELECT h.start_time, CAST(h.start_time AS DATE), h.executed_by, 'query history', CAST(NULL AS STRING), h.statement_text,
-       h.execution_status, h.workspace_id, h.statement_id
+SELECT h.start_time, CAST(h.start_time AS DATE), h.executed_by, 'query history', CAST(NULL AS STRING),
+       {text('h.statement_text')}, h.execution_status, h.workspace_id, h.statement_id
 FROM system.query.history h
-WHERE h.executed_by <> '{lit(me)}'
-  AND ({' OR '.join(f"contains(lower(h.statement_text), '{r.lower()}')" for r in restricted)})""",
-        "statements": f"""SELECT h.start_time, h.end_time, h.executed_by, h.executed_as, h.executed_by = '{lit(me)}' AS by_compiler,
-       h.statement_type, h.execution_status, h.error_message, h.from_result_cache, h.cache_origin_statement_id,
-       h.produced_rows, h.total_duration_ms, h.compute.warehouse_id AS warehouse_id, h.workspace_id,
-       h.client_application, h.statement_id, h.statement_text
+WHERE h.executed_by IS DISTINCT FROM '{m}'
+  AND ({' OR '.join(f"contains({norm}, '{r.lower()}')" for r in restricted)})
+  AND NOT contains({norm}, '{c.lower()}.{AUDIT}.')""",
+        "statements": f"""SELECT h.start_time, h.end_time, h.executed_by, h.executed_as, coalesce(h.executed_by = '{m}', false) AS by_compiler,
+       h.statement_type, h.execution_status, {text('h.error_message')} AS error_message, h.from_result_cache,
+       h.cache_origin_statement_id, h.produced_rows, h.total_duration_ms, h.compute.warehouse_id AS warehouse_id,
+       h.workspace_id, h.client_application, h.statement_id, {text('h.statement_text')} AS statement_text
 FROM system.query.history h
-WHERE contains(lower(h.statement_text), '{c.lower()}')""",
-        "governance_changes": f"""SELECT changed_at, event_date, changed_by, changed_by = '{lit(me)}' AS by_compiler, change, object_name, detail,
-       CASE WHEN status_code = 200 THEN 'done' WHEN status_code IN (401, 403) THEN 'denied' ELSE 'failed' END AS outcome,
+WHERE {names_catalog}""",
+        "governance_changes": f"""SELECT changed_at, event_date, changed_by, coalesce(changed_by = '{m}', false) AS by_compiler, change, object_name,
+       detail, CASE WHEN status_code = 200 THEN 'done' WHEN status_code IN (401, 403) THEN 'denied' ELSE 'failed' END AS outcome,
        error_message, workspace_id, source_ip_address, request_id
 FROM (
   SELECT a.event_time AS changed_at, a.event_date, a.user_identity.email AS changed_by, a.response.status_code,
@@ -470,7 +482,7 @@ FROM (
           AND NOT (action_name = 'createStagingTable' AND response.status_code = 200)) a)
 WHERE (object_name = '{c}' OR startswith(object_name, '{c}.'))
   -- the compiler's own data writes and staging tables are in governance.compile_log; its grants, owners and views stay
-  AND NOT (changed_by = '{lit(me)}' AND (change = 'alter or write' OR contains(object_name, '._stage_')))""",
+  AND NOT (coalesce(changed_by = '{m}', false) AND (change = 'alter or write' OR contains(object_name, '._stage_')))""",
         "entitlement_changes": f"""SELECT user_principal, change_type, valid_from, valid_to, valid_to IS NULL AS is_current,
        personas, lag(personas) OVER w AS personas_before,
        array_sort(map_keys(grants)) AS granted_pairs, lag(array_sort(map_keys(grants))) OVER w AS granted_pairs_before,
@@ -487,7 +499,7 @@ def generate_audit():
     """The audit schema holds exactly the audit views, each as generated (recreated when its SQL changes or it was
     edited); the auditors may read it. A view that can't be created (for example the compiler can't read a system
     table) is reported and the job fails; the others are in place."""
-    t0, versions = time.time(), source_versions()
+    t0 = time.time()
     ensure_tables()
     me = q("SELECT session_user()")[0][0]
     q(f"""CREATE SCHEMA IF NOT EXISTS {C}.{AUDIT}
@@ -523,7 +535,7 @@ COMMENT 'Generated audit views over the system tables and the governance history
     for v, kind in q(f"SELECT table_name, table_type FROM {C}.information_schema.tables WHERE table_schema = '{AUDIT}'"):
         if kind == "VIEW" and v in want:
             continue
-        what = {"VIEW": "VIEW", "METRIC_VIEW": "VIEW", "MATERIALIZED_VIEW": "MATERIALIZED VIEW"}.get(kind, "TABLE")
+        what = {"VIEW": "VIEW", "METRIC_VIEW": "VIEW", "MATERIALIZED_VIEW": "MATERIALIZED VIEW", "STREAMING_TABLE": "TABLE"}.get(kind, "TABLE")
         if drop(f"DROP {what} {C}.{AUDIT}.`{v}`", v, failed, AUDIT, "audit_views"):
             print(f"audit: WARNING dropped {AUDIT}.{v} ({kind}): only the audit views may be in {AUDIT}")
     for f, in q(f"SELECT specific_name FROM {C}.information_schema.routines WHERE specific_schema = '{AUDIT}'"):
@@ -545,7 +557,7 @@ COMMENT 'Generated audit views over the system tables and the governance history
             except RuntimeError as err:
                 failed.append(f"grant to {who}")
                 print(f"audit: ERROR could not grant {who} read on {AUDIT}: {' '.join(str(err).split())[:160]}")
-    log("audit", t0, f"{len(want)} audit views, {made} (re)created" + (f", FAILED {failed}" if failed else ""), versions)
+    log("audit", t0, f"{len(want)} audit views, {made} (re)created" + (f", FAILED {failed}" if failed else ""), {})
     print(f"audit: {len(want)} audit views, {made} (re)created ({time.time() - t0:.0f}s)")
     if failed:
         raise RuntimeError(f"audit views not (re)created: {failed}")
@@ -647,11 +659,16 @@ if __name__ == "__main__":
     ap.add_argument("--as", dest="who", default=None, help="run as this principal (locally: compiler)")
     a = ap.parse_args()
     w = dbsql.client(a.who)
-    if a.step in ("entitlements", "all"):
-        compile_entitlements()
-    if a.step in ("views", "all"):
-        generate_views()
-    if a.step in ("audit", "all"):
-        generate_audit()
-    if a.step in ("guard", "all"):
-        guard()
+    errors = []
+    for name, fn in (("entitlements", compile_entitlements), ("views", generate_views), ("audit", generate_audit),
+                     ("guard", guard)):
+        if a.step in (name, "all"):
+            try:
+                fn()
+            except RuntimeError as err:  # as in the job (run_if: ALL_DONE): the guard still runs, then the run fails
+                if a.step != "all":
+                    raise
+                errors.append(f"{name}: {err}")
+                print(f"{name}: FAILED: {err}")
+    if errors:
+        raise RuntimeError(f"{len(errors)} step(s) failed: {errors}")

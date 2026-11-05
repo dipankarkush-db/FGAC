@@ -54,24 +54,26 @@ def refused(who, sql):
 
 
 def main():
-    tag = random.randint(10**8, 10**9 - 1)  # makes every statement unique (no result cache) and findable
+    tag = random.randint(10**8, 10**9 - 1)  # makes every statement unique (no result cache)
+    # findable in the query history: a comment survives the redaction of literals (audit_statement_text)
+    mark, mark_rt = f"/* audit_test_t{tag} */", f"/* audit_test_r{tag} */"
     reader, intruder, grantee = (config.app_id(k) for k in (READER, INTRUDER, GRANTEE))
     t0 = a("SELECT CAST(current_timestamp() - INTERVAL 1 MINUTE AS STRING)")[0][0]
     since = f"TIMESTAMP '{t0}'"
     print(f"tag {tag}; events from {t0}")
 
     # 1. reads of a secured view
-    dbsql.run(dbsql.client(READER), f"SELECT count(*), sum(bonus) FROM {V} WHERE win <> {tag}", quiet=True)
+    dbsql.run(dbsql.client(READER), f"SELECT {mark} count(*), sum(bonus) FROM {V} WHERE win <> {tag}", quiet=True)
     rt = config.RT_WAREHOUSE_NAME and any(x.name == config.RT_WAREHOUSE_NAME for x in admin.warehouses.list())
     if rt:
-        on(config.RT_WAREHOUSE_NAME, READER, f"SELECT count(*), sum(bonus) FROM {V} WHERE win <> {tag + 1}")
+        on(config.RT_WAREHOUSE_NAME, READER, f"SELECT {mark_rt} count(*), sum(bonus) FROM {V} WHERE win <> {tag + 1}")
     # 2. refused attempts
-    assert refused(INTRUDER, f"SELECT count(*) FROM {B}.associate_compensation WHERE win <> {tag}"), "base table readable"
+    assert refused(INTRUDER, f"SELECT {mark} count(*) FROM {B}.associate_compensation WHERE win <> {tag}"), "base table readable"
     probe = f"audit_probe_{tag}"
     assert refused(INTRUDER, f"CREATE VIEW {S}.{probe} AS SELECT 1 AS x"), "a user could create a view"
     assert refused(INTRUDER, f"CREATE TABLE {S}.{probe}_copy AS SELECT * FROM {V}"), "a user could copy a view"
     # 3. the admin: a direct read, and a stray grant that the guard takes back
-    a(f"SELECT count(*) FROM {B}.associate_compensation WHERE win <> {tag}")
+    a(f"SELECT {mark} count(*) FROM {B}.associate_compensation WHERE win <> {tag}")
     a(f"GRANT SELECT ON TABLE {G}.compile_log TO `{grantee}`")
     subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "compiler",
                     "fgac_compiler.py"), "guard", "--as", "compiler"], check=True, stdout=subprocess.DEVNULL)
@@ -85,10 +87,10 @@ def main():
               AND to_json(personas_then) = '{personas}'""",
         "statements: the same read, with its SQL text and the user": f"""
             SELECT count(*) FROM {A}.statements WHERE start_time >= {since} AND executed_by = '{reader}'
-              AND contains(statement_text, 'win <> {tag}') AND execution_status = 'FINISHED' AND NOT by_compiler""",
+              AND contains(statement_text, 'audit_test_t{tag}') AND execution_status = 'FINISHED' AND NOT by_compiler""",
         f"statements: {INTRUDER}'s refused read of the base table": f"""
             SELECT count(*) FROM {A}.statements WHERE start_time >= {since} AND executed_by = '{intruder}'
-              AND contains(statement_text, '{config.BASE}.associate_compensation WHERE win <> {tag}')
+              AND contains(statement_text, 'audit_test_t{tag}') AND contains(statement_text, '{config.BASE}.associate_compensation')
               AND execution_status = 'FAILED'""",
         f"governance_changes: {INTRUDER}'s refused attempt to create a view": f"""
             SELECT count(*) FROM {A}.governance_changes WHERE {day} AND changed_at >= {since} AND changed_by = '{intruder}'
@@ -104,10 +106,10 @@ def main():
               AND contains(detail, 'remove') AND outcome = 'done'""",
         "restricted_reads: the admin's direct read of a base table": f"""
             SELECT count(*) FROM {A}.restricted_reads WHERE {day} AND read_at >= {since} AND reader = '{config.ADMIN}'
-              AND (object_name = '{B}.associate_compensation' OR contains(statement_text, 'win <> {tag}'))""",
+              AND (object_name = '{B}.associate_compensation' OR contains(statement_text, 'audit_test_t{tag}'))""",
         f"restricted_reads: {INTRUDER}'s refused read of the base table": f"""
             SELECT count(*) FROM {A}.restricted_reads WHERE {day} AND read_at >= {since} AND reader = '{intruder}'
-              AND contains(statement_text, 'win <> {tag}') AND execution_status = 'FAILED'""",
+              AND contains(statement_text, 'audit_test_t{tag}') AND execution_status = 'FAILED'""",
         f"governance_changes: {INTRUDER}'s refused copy of the view into a table": f"""
             SELECT count(*) FROM {A}.governance_changes WHERE {day} AND changed_at >= {since} AND changed_by = '{intruder}'
               AND object_name = '{S}.{probe}_copy' AND outcome = 'denied'""",
@@ -118,10 +120,15 @@ def main():
             SELECT count(*) FROM {A}.entitlement_changes WHERE user_principal = '{reader}' AND is_current
               AND to_json(personas) = '{personas}'""",
     }
+    if config.AUDIT_STATEMENT_TEXT == "redacted":
+        checks["statements: literals are redacted (the number in the read's WHERE is shown as ?)"] = f"""
+            SELECT count(*) FROM {A}.statements WHERE start_time >= {since} AND executed_by = '{reader}'
+              AND contains(statement_text, 'audit_test_t{tag}') AND contains(statement_text, 'win <> ?')
+              AND NOT contains(statement_text, 'win <> {tag}')"""
     if rt:
         checks["statements: the read on the Real-Time warehouse"] = f"""
             SELECT count(*) FROM {A}.statements s WHERE start_time >= {since} AND executed_by = '{reader}'
-              AND contains(statement_text, 'win <> {tag + 1}') AND warehouse_id = '{
+              AND contains(statement_text, 'audit_test_r{tag}') AND warehouse_id = '{
               next(x.id for x in admin.warehouses.list() if x.name == config.RT_WAREHOUSE_NAME)}'"""
         checks[f"view_reads: both reads by {READER} (SQL warehouse and Real-Time)"] = f"""
             SELECT CASE WHEN count(*) >= 2 THEN 1 ELSE 0 END FROM {A}.view_reads WHERE {day} AND read_at >= {since}
@@ -135,6 +142,12 @@ def main():
             break
         print(f"    {len(found)} of {len(checks)} found after {(time.time() - start) / 60:.0f} min; waiting for the system tables")
         time.sleep(60)
+    # and what must NOT be there: a read through a secured view is not a direct read of a restricted table
+    stray = int(a(f"""SELECT count(*) FROM {A}.restricted_reads WHERE {day} AND read_at >= {since}
+                       AND reader = '{reader}'""")[0][0])
+    checks[f"restricted_reads: nothing for {READER} (only secured view reads)"] = None
+    if stray == 0:
+        found[f"restricted_reads: nothing for {READER} (only secured view reads)"] = time.time() - start
     failures = 0
     for name in checks:
         ok = name in found
