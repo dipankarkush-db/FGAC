@@ -1,0 +1,23 @@
+{
+  "profile": "<workspace-profile>",
+  "host": "https://<your-workspace-url>",
+  "account_id": "<your-account-id>",
+  "account_profile": "<account-profile>",
+  "admin": "<you@your-company.com>",
+  "warehouse_name": "fgac-poc",
+  "realtime_warehouse_name": "fgac-rt",
+  "catalog": "fgac_poc",
+  "sp_prefix": "fgac-",
+  "job_prefix": "fgac-",
+  "sp_creds_file": "~/.fgac_principals.json",
+  "unclassified_rule": "highly_sensitive",
+  "terminated_statuses": ["Terminated"],
+  "auditors": [],
+  "scope_check": "join",
+  "large_data": {
+    "catalog": "fgac_large",
+    "associates": 10000000,
+    "warehouse_name": "fgac-large",
+    "warehouse_size": "Large"
+  }
+}

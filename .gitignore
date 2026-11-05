@@ -1,0 +1,8 @@
+# your workspace's settings (copy config.example.json)
+config.json
+# the Databricks CLI's local bundle state
+.databricks/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
